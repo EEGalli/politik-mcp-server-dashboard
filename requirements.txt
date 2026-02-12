@@ -1,4 +1,8 @@
 mcp>=1.0.0
+pydantic-ai>=1.0.0
 python-arango>=8.0.0
 python-dotenv>=1.0.0
 httpx>=0.28.0
+pymupdf>=1.26.0
+
+streamlit>=1.38.0

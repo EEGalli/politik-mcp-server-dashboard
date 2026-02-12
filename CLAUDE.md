@@ -5,6 +5,7 @@
 - Var ödmjuk
 - Gissa aldrig, säg till om du är osäker på något
 - Innan en import tas bort: sök alltid efter att symbolen verkligen är oanvänd i hela filen
+- Dubbelkolla om vi redan har ett program eller bibliotek för ändramålet innan vi laddar ner nytt
 
 ---
 

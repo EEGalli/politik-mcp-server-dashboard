@@ -2,8 +2,9 @@
 ArangoDB-datamodeller för politik-mcp-server.
 
 Collections:
-  - politicians:  Politiker (namn, parti, sociala medier)
-  - promises:     Vallöften kopplade till politiker
+  - parties:      Partier (namn, förkortning, block, webbplats)
+  - politicians:  Politiker (namn, parti-koppling, sociala medier)
+  - promises:     Vallöften kopplade till partier
   - analyses:     Videoanalyser (transkription, kategori, etc.)
   - comparisons:  Jämförelser mellan analyser och löften (edge collection)
 """
@@ -11,17 +12,22 @@ Collections:
 from arango import ArangoClient
 import os
 
-ARANGO_HOST = os.getenv("ARANGO_HOST", "http://127.0.0.1:8530")
-ARANGO_DB = os.getenv("ARANGO_DB", "politik_mcp")
-ARANGO_USER = os.getenv("ARANGO_USER", "root")
-ARANGO_PASSWORD = os.getenv("ARANGO_PASSWORD", "")
-
 COLLECTIONS = {
+    "parties": {
+        "type": "document",
+        "schema": {
+            "name": str,           # "Moderaterna"
+            "abbreviation": str,   # "M"
+            "block": str,          # "höger", "vänster", "mitt"
+            "website_url": str,    # "https://moderaterna.se"
+            "created_at": str,
+        },
+    },
     "politicians": {
         "type": "document",
         "schema": {
             "name": str,           # "Ulf Kristersson"
-            "party": str,          # "Moderaterna"
+            "party_key": str,      # Koppling till parti
             "social_media": dict,  # {"tiktok": "@ulf", "instagram": "@ulf"}
             "created_at": str,
         },
@@ -29,7 +35,7 @@ COLLECTIONS = {
     "promises": {
         "type": "document",
         "schema": {
-            "politician_key": str,  # Koppling till politiker
+            "party_key": str,       # Koppling till parti
             "text": str,            # Löftets text
             "category": str,        # "Skola", "Sjukvård", etc.
             "source_url": str,      # Varifrån löftet hämtades
@@ -67,13 +73,18 @@ COLLECTIONS = {
 
 def get_db():
     """Anslut till ArangoDB och returnera databasobjektet."""
-    client = ArangoClient(hosts=ARANGO_HOST)
-    sys_db = client.db("_system", username=ARANGO_USER, password=ARANGO_PASSWORD)
+    arango_host = os.getenv("ARANGO_HOST", "http://127.0.0.1:8530")
+    arango_db = os.getenv("ARANGO_DB", "politik_mcp")
+    arango_user = os.getenv("ARANGO_USER", "root")
+    arango_password = os.getenv("ARANGO_PASSWORD", "")
 
-    if not sys_db.has_database(ARANGO_DB):
-        sys_db.create_database(ARANGO_DB)
+    client = ArangoClient(hosts=arango_host)
+    sys_db = client.db("_system", username=arango_user, password=arango_password)
 
-    db = client.db(ARANGO_DB, username=ARANGO_USER, password=ARANGO_PASSWORD)
+    if not sys_db.has_database(arango_db):
+        sys_db.create_database(arango_db)
+
+    db = client.db(arango_db, username=arango_user, password=arango_password)
     return db
 
 

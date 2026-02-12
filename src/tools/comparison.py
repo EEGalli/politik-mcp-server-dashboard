@@ -36,10 +36,11 @@ def get_consistency_report(db, politician_key: str) -> dict:
     """
     query = """
     LET politician = DOCUMENT(CONCAT("politicians/", @politician_key))
+    LET party = DOCUMENT(CONCAT("parties/", politician.party_key))
 
     LET promises = (
         FOR p IN promises
-            FILTER p.politician_key == @politician_key
+            FILTER p.party_key == politician.party_key
             RETURN p
     )
 
@@ -68,7 +69,8 @@ def get_consistency_report(db, politician_key: str) -> dict:
 
     RETURN {
         politician: politician.name,
-        party: politician.party,
+        party: party.name,
+        party_abbreviation: party.abbreviation,
         total_promises: LENGTH(promises),
         total_analyses: LENGTH(analyses),
         total_comparisons: LENGTH(comparisons),

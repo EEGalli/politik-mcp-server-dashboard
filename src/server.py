@@ -2,12 +2,12 @@
 Politik MCP Server — Analysera politikers sociala medier vs vallöften.
 
 Exponerar tools för Claude Desktop:
-  - add_politician
-  - list_politicians
-  - add_promise
-  - get_promises
-  - save_analysis
-  - compare_content_vs_promise
+  - add_party, list_parties, get_party_details
+  - add_politician, list_politicians, get_politician_details
+  - add_promise, get_promises
+  - save_analysis, search_analyses
+  - scrape_party_promises (AI-driven scraping av vallöften)
+  - compare_content_vs_promise (AI-driven via pydantic-ai + Ollama)
   - get_consistency_report
 """
 
@@ -18,16 +18,21 @@ from mcp.server.fastmcp import FastMCP
 
 from src.db.models import init_db
 from src.tools.politicians import (
+    add_party as _add_party,
+    list_parties as _list_parties,
+    get_party as _get_party,
     add_politician as _add_politician,
     list_politicians as _list_politicians,
     get_politician as _get_politician,
     add_promise as _add_promise,
     get_promises as _get_promises,
+    delete_promise as _delete_promise,
 )
 from src.tools.comparison import (
     save_comparison as _save_comparison,
     get_consistency_report as _get_consistency_report,
 )
+from src.agents import compare_analysis_with_promise, extract_promises_from_text, fetch_page_text
 
 mcp = FastMCP(
     "Politik Analyzer",
@@ -45,16 +50,57 @@ def get_db():
     return _db
 
 
+# ── Parti-tools ────────────────────────────────────────────────
+
+
+@mcp.tool()
+def add_party(name: str, abbreviation: str, block: str = "", website_url: str = "") -> str:
+    """Lägg till ett parti i databasen.
+
+    Args:
+        name: Partiets fullständiga namn, t.ex. "Moderaterna"
+        abbreviation: Partiförkortning, t.ex. "M"
+        block: Politiskt block: vänster, höger, mitt (valfritt)
+        website_url: Partiets webbplats (valfritt)
+    """
+    result = _add_party(get_db(), name, abbreviation, block, website_url)
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def list_parties() -> str:
+    """Lista alla partier i databasen."""
+    results = _list_parties(get_db())
+    return json.dumps(results, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_party_details(party_key: str) -> str:
+    """Hämta detaljerad info om ett parti, inklusive dess vallöften.
+
+    Args:
+        party_key: Partiets databas-nyckel
+    """
+    db = get_db()
+    party = _get_party(db, party_key)
+    if not party:
+        return json.dumps({"error": f"Parti med nyckel '{party_key}' hittades inte"})
+
+    promises = _get_promises(db, party_key)
+    party["promises"] = promises
+    return json.dumps(party, ensure_ascii=False, default=str)
+
+
 # ── Politiker-tools ──────────────────────────────────────────────
 
 
 @mcp.tool()
-def add_politician(name: str, party: str, tiktok: str = "", instagram: str = "", twitter: str = "") -> str:
+def add_politician(name: str, party_key: str, tiktok: str = "", instagram: str = "", twitter: str = "") -> str:
     """Lägg till en ny politiker i databasen.
 
     Args:
         name: Politikerns fullständiga namn, t.ex. "Ulf Kristersson"
-        party: Partinamn, t.ex. "Moderaterna"
+        party_key: Partiets databas-nyckel (hämta med list_parties)
         tiktok: TikTok-användarnamn (valfritt)
         instagram: Instagram-användarnamn (valfritt)
         twitter: Twitter/X-användarnamn (valfritt)
@@ -67,24 +113,24 @@ def add_politician(name: str, party: str, tiktok: str = "", instagram: str = "",
     if twitter:
         social_media["twitter"] = twitter
 
-    result = _add_politician(get_db(), name, party, social_media)
+    result = _add_politician(get_db(), name, party_key, social_media)
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
-def list_politicians(party: str = "") -> str:
+def list_politicians(party_key: str = "") -> str:
     """Lista alla politiker i databasen, valfritt filtrerade per parti.
 
     Args:
-        party: Filtrera per parti (lämna tomt för alla)
+        party_key: Filtrera per parti-nyckel (lämna tomt för alla)
     """
-    results = _list_politicians(get_db(), party or None)
+    results = _list_politicians(get_db(), party_key or None)
     return json.dumps(results, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
 def get_politician_details(politician_key: str) -> str:
-    """Hämta detaljerad info om en politiker, inklusive deras vallöften.
+    """Hämta detaljerad info om en politiker, inklusive partiets vallöften.
 
     Args:
         politician_key: Politikerns databas-nyckel
@@ -94,8 +140,15 @@ def get_politician_details(politician_key: str) -> str:
     if not politician:
         return json.dumps({"error": f"Politiker med nyckel '{politician_key}' hittades inte"})
 
-    promises = _get_promises(db, politician_key)
+    # Hämta partiinfo
+    party = _get_party(db, politician.get("party_key", ""))
+    if party:
+        politician["party"] = party
+
+    # Hämta partiets vallöften
+    promises = _get_promises(db, politician.get("party_key", ""))
     politician["promises"] = promises
+
     return json.dumps(politician, ensure_ascii=False, default=str)
 
 
@@ -104,37 +157,107 @@ def get_politician_details(politician_key: str) -> str:
 
 @mcp.tool()
 def add_promise(
-    politician_key: str,
+    party_key: str,
     text: str,
     category: str,
     source_url: str = "",
     source_name: str = "",
     date: str = "",
 ) -> str:
-    """Lägg till ett vallöfte kopplat till en politiker.
+    """Lägg till ett vallöfte kopplat till ett parti.
 
     Args:
-        politician_key: Politikerns databas-nyckel
+        party_key: Partiets databas-nyckel
         text: Vallöftets text, t.ex. "Vi ska sänka skatten med 10%"
         category: Kategori, t.ex. "Skatt", "Sjukvård", "Skola"
         source_url: URL till källan (valfritt)
         source_name: Namn på källan, t.ex. "Valmanifest 2022" (valfritt)
         date: Datum för löftet, YYYY-MM-DD (valfritt)
     """
-    result = _add_promise(get_db(), politician_key, text, category, source_url, source_name, date)
+    result = _add_promise(get_db(), party_key, text, category, source_url, source_name, date)
     return json.dumps(result, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
-def get_promises(politician_key: str, category: str = "") -> str:
-    """Hämta vallöften för en politiker, valfritt filtrerade per kategori.
+def get_promises(party_key: str, category: str = "") -> str:
+    """Hämta vallöften för ett parti, valfritt filtrerade per kategori.
 
     Args:
-        politician_key: Politikerns databas-nyckel
+        party_key: Partiets databas-nyckel
         category: Filtrera per kategori (lämna tomt för alla)
     """
-    results = _get_promises(get_db(), politician_key, category or None)
+    results = _get_promises(get_db(), party_key, category or None)
     return json.dumps(results, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def delete_promise(promise_key: str) -> str:
+    """Radera ett vallöfte via dess nyckel.
+
+    Args:
+        promise_key: Dokumentnyckel i promises-collectionen
+    """
+    result = _delete_promise(get_db(), promise_key)
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+# ── Scraping-tools ───────────────────────────────────────────────
+
+
+@mcp.tool()
+async def scrape_party_promises(party_key: str, urls: list[str]) -> str:
+    """Hämta och extrahera vallöften automatiskt från webbsidor eller PDF:er.
+    Använder AI (Ollama/Gemma3) för att identifiera konkreta vallöften i texten.
+
+    Args:
+        party_key: Partiets databas-nyckel
+        urls: Lista med URL:er till partiets policy-sidor (HTML eller PDF)
+    """
+    db = get_db()
+
+    # Verifiera att partiet finns
+    party = _get_party(db, party_key)
+    if not party:
+        return json.dumps({"error": f"Parti med nyckel '{party_key}' hittades inte"})
+
+    party_name = party["name"]
+    all_saved = []
+    errors = []
+
+    for url in urls:
+        try:
+            # Hämta och extrahera text
+            text = await fetch_page_text(url)
+            if not text.strip():
+                errors.append({"url": url, "error": "Ingen text kunde extraheras"})
+                continue
+
+            # Kör AI-agenten för att hitta vallöften
+            extracted = await extract_promises_from_text(text, party_name, url)
+
+            # Spara varje löfte i databasen
+            for promise in extracted.promises:
+                saved = _add_promise(
+                    db,
+                    party_key,
+                    promise.text,
+                    promise.category,
+                    source_url=url,
+                    source_name=f"{party_name}s hemsida",
+                )
+                all_saved.append(saved)
+
+        except Exception as e:
+            errors.append({"url": url, "error": str(e)})
+
+    result = {
+        "party": party_name,
+        "urls_processed": len(urls),
+        "promises_extracted": len(all_saved),
+        "promises": all_saved,
+        "errors": errors,
+    }
+    return json.dumps(result, ensure_ascii=False, default=str)
 
 
 # ── Analys-tools ─────────────────────────────────────────────────
@@ -222,30 +345,69 @@ def search_analyses(
 
 
 @mcp.tool()
-def compare_content_vs_promise(
+async def compare_content_vs_promise(
     analysis_key: str,
     promise_key: str,
-    match_score: float,
-    match_type: str,
-    explanation: str,
 ) -> str:
-    """Spara en jämförelse mellan en videoanalys och ett vallöfte.
+    """Jämför en videoanalys med ett vallöfte med hjälp av AI.
+    Använder en lokal Ollama-modell (Gemma3) för att bedöma
+    hur väl innehållet stämmer överens med löftet.
 
     Args:
         analysis_key: Nyckel för videoanalysen
         promise_key: Nyckel för vallöftet
-        match_score: Matchpoäng 0.0-1.0 (hur väl stämmer de överens)
-        match_type: "supports" (stöder), "contradicts" (motsäger), eller "unrelated" (orelaterat)
-        explanation: Förklaring av jämförelsen på svenska
     """
-    result = _save_comparison(get_db(), analysis_key, promise_key, match_score, match_type, explanation)
-    return json.dumps(result, ensure_ascii=False, default=str)
+    db = get_db()
+
+    # Hämta analysen
+    analyses_col = db.collection("analyses")
+    if not analyses_col.has(analysis_key):
+        return json.dumps({"error": f"Analys '{analysis_key}' hittades inte"})
+    analysis = analyses_col.get(analysis_key)
+
+    # Hämta löftet
+    promises_col = db.collection("promises")
+    if not promises_col.has(promise_key):
+        return json.dumps({"error": f"Löfte '{promise_key}' hittades inte"})
+    promise = promises_col.get(promise_key)
+
+    # Hämta politikern och partiet
+    politician = _get_politician(db, analysis.get("politician_key", ""))
+    politician_name = politician["name"] if politician else "Okänd"
+    party_doc = _get_party(db, politician.get("party_key", "")) if politician else None
+    party = party_doc["name"] if party_doc else "Okänt"
+
+    # Kör AI-agenten för jämförelse
+    comparison_result = await compare_analysis_with_promise(
+        transcription=analysis.get("transcription", ""),
+        summary=analysis.get("summary", ""),
+        promise_text=promise.get("text", ""),
+        promise_category=promise.get("category", ""),
+        politician_name=politician_name,
+        party=party,
+    )
+
+    # Spara resultatet i databasen
+    saved = _save_comparison(
+        db,
+        analysis_key,
+        promise_key,
+        comparison_result.match_score,
+        comparison_result.match_type,
+        comparison_result.explanation,
+    )
+
+    # Returnera både AI-resultatet och den sparade jämförelsen
+    return json.dumps({
+        "comparison": comparison_result.model_dump(),
+        "saved": saved,
+    }, ensure_ascii=False, default=str)
 
 
 @mcp.tool()
 def get_consistency_report(politician_key: str) -> str:
     """Generera en konsistensrapport för en politiker.
-    Visar hur väl deras sociala medier-innehåll stämmer överens med vallöften.
+    Visar hur väl deras sociala medier-innehåll stämmer överens med partiets vallöften.
 
     Args:
         politician_key: Politikerns databas-nyckel
@@ -272,18 +434,9 @@ def get_categories() -> str:
 
 @mcp.resource("politik://parties")
 def get_parties() -> str:
-    """Lista svenska riksdagspartier."""
-    parties = [
-        {"name": "Socialdemokraterna", "abbr": "S", "block": "vänster"},
-        {"name": "Moderaterna", "abbr": "M", "block": "höger"},
-        {"name": "Sverigedemokraterna", "abbr": "SD", "block": "höger"},
-        {"name": "Centerpartiet", "abbr": "C", "block": "mitt"},
-        {"name": "Vänsterpartiet", "abbr": "V", "block": "vänster"},
-        {"name": "Kristdemokraterna", "abbr": "KD", "block": "höger"},
-        {"name": "Liberalerna", "abbr": "L", "block": "höger"},
-        {"name": "Miljöpartiet", "abbr": "MP", "block": "vänster"},
-    ]
-    return json.dumps(parties, ensure_ascii=False)
+    """Lista alla partier från databasen."""
+    results = _list_parties(get_db())
+    return json.dumps(results, ensure_ascii=False, default=str)
 
 
 # ── Prompts ──────────────────────────────────────────────────────
@@ -291,7 +444,7 @@ def get_parties() -> str:
 
 @mcp.prompt()
 def analyze_politician(politician_name: str) -> str:
-    """Analysera en politikers sociala medier vs vallöften.
+    """Analysera en politikers sociala medier vs partiets vallöften.
 
     Args:
         politician_name: Politikerns namn
@@ -299,7 +452,7 @@ def analyze_politician(politician_name: str) -> str:
     return f"""Analysera politikern {politician_name}:
 
 1. Sök efter politikern i databasen med list_politicians
-2. Hämta deras vallöften med get_promises
+2. Hämta deras parti och partiets vallöften med get_politician_details
 3. Sök deras videoanalyser med search_analyses
 4. Jämför varje videoanalys med relevanta vallöften med compare_content_vs_promise
 5. Generera en konsistensrapport med get_consistency_report
@@ -319,8 +472,8 @@ def scrape_promises(party_name: str) -> str:
 1. Sök efter partiets officiella hemsida och valmanifest
 2. Identifiera konkreta vallöften (specifika åtaganden, inte vaga visioner)
 3. Kategorisera varje löfte (Skatt, Sjukvård, Skola, etc.)
-4. Lägg till politikern med add_politician om de inte redan finns
-5. Spara varje löfte med add_promise
+4. Lägg till partiet med add_party om det inte redan finns
+5. Spara varje löfte med add_promise (använd partiets party_key)
 
 Fokusera på:
 - Konkreta, mätbara löften
