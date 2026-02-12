@@ -87,17 +87,47 @@ def add_promise(
     source_url: str = "",
     source_name: str = "",
     date: str = "",
+    mention_count: int = 1,
+    source_urls: list[str] | None = None,
+    source_count: int = 0,
+    last_seen_at: str = "",
 ) -> dict:
     """Lägg till ett vallöfte kopplat till ett parti."""
     collection = db.collection("promises")
+
+    normalized_source_urls: list[str] = []
+    if isinstance(source_urls, list):
+        for item in source_urls:
+            cleaned = str(item or "").strip()
+            if cleaned and cleaned not in normalized_source_urls:
+                normalized_source_urls.append(cleaned)
+
+    if source_url and source_url not in normalized_source_urls:
+        normalized_source_urls.append(source_url)
+
+    try:
+        safe_mention_count = int(mention_count or 1)
+    except Exception:
+        safe_mention_count = 1
+    safe_mention_count = max(1, safe_mention_count)
+
+    try:
+        safe_source_count = int(source_count or 0)
+    except Exception:
+        safe_source_count = 0
+    safe_source_count = max(safe_source_count, len(normalized_source_urls))
 
     doc = {
         "party_key": party_key,
         "text": text,
         "category": category,
         "source_url": source_url,
+        "source_urls": normalized_source_urls,
+        "source_count": safe_source_count,
         "source_name": source_name,
         "date": date or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "mention_count": safe_mention_count,
+        "last_seen_at": last_seen_at or datetime.now(timezone.utc).isoformat(),
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     result = collection.insert(doc)

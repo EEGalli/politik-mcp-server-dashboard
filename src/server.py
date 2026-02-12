@@ -12,7 +12,9 @@ Exponerar tools för Claude Desktop:
 """
 
 import json
+import re
 from datetime import datetime, timezone
+from typing import Any
 
 from mcp.server.fastmcp import FastMCP
 
@@ -32,7 +34,12 @@ from src.tools.comparison import (
     save_comparison as _save_comparison,
     get_consistency_report as _get_consistency_report,
 )
-from src.agents import compare_analysis_with_promise, extract_promises_from_text, fetch_page_text
+from src.agents import (
+    compare_analysis_with_promise,
+    crawl_site_texts,
+    extract_promises_from_text,
+    fetch_page_text,
+)
 
 mcp = FastMCP(
     "Politik Analyzer",
@@ -204,14 +211,51 @@ def delete_promise(promise_key: str) -> str:
 # ── Scraping-tools ───────────────────────────────────────────────
 
 
+def _normalize_promise_text(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "").strip().lower())
+
+
+def _coerce_int(value: Any, default: int = 0, minimum: int = 0) -> int:
+    try:
+        parsed = int(value)
+    except Exception:
+        parsed = default
+    return max(minimum, parsed)
+
+
+def _extract_source_urls(promise: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    primary_url = str(promise.get("source_url", "") or "").strip()
+    if primary_url:
+        urls.append(primary_url)
+
+    extra_urls = promise.get("source_urls")
+    if isinstance(extra_urls, list):
+        for url in extra_urls:
+            cleaned = str(url or "").strip()
+            if cleaned and cleaned not in urls:
+                urls.append(cleaned)
+    return urls
+
+
 @mcp.tool()
-async def scrape_party_promises(party_key: str, urls: list[str]) -> str:
+async def scrape_party_promises(
+    party_key: str,
+    urls: list[str],
+    crawl: bool = True,
+    max_pages_per_url: int = 25,
+    max_depth: int = 2,
+) -> str:
     """Hämta och extrahera vallöften automatiskt från webbsidor eller PDF:er.
     Använder AI (Ollama/Gemma3) för att identifiera konkreta vallöften i texten.
+    Om crawl=True (default) följer den interna länkar automatiskt.
 
     Args:
         party_key: Partiets databas-nyckel
         urls: Lista med URL:er till partiets policy-sidor (HTML eller PDF)
+        crawl: Om True, crawla interna undersidor från varje start-URL
+        max_pages_per_url: Max antal sidor att hämta per start-URL vid crawl
+        max_depth: Hur många länknivåer från start-URL som ska följas
     """
     db = get_db()
 
@@ -223,37 +267,141 @@ async def scrape_party_promises(party_key: str, urls: list[str]) -> str:
     party_name = party["name"]
     all_saved = []
     errors = []
+    pages_processed = 0
+    duplicates_skipped = 0
+    effective_max_pages_per_url = max(1, min(int(max_pages_per_url or 1), 80))
+    effective_max_depth = max(0, min(int(max_depth or 0), 4))
+    promises_collection = db.collection("promises")
+
+    # Förhindra dubbletter både mot tidigare databasinnehåll och inom samma körning.
+    existing_promises = _get_promises(db, party_key)
+    seen_promises: dict[str, dict[str, Any]] = {}
+    for row in existing_promises:
+        if not isinstance(row, dict):
+            continue
+        normalized_text = _normalize_promise_text(str(row.get("text", "")))
+        promise_key = str(row.get("_key", "")).strip()
+        if not normalized_text or not promise_key:
+            continue
+
+        mention_count = _coerce_int(row.get("mention_count"), default=1, minimum=1)
+        source_urls = _extract_source_urls(row)
+        source_count = max(
+            _coerce_int(row.get("source_count"), default=0, minimum=0),
+            len(source_urls),
+        )
+
+        if normalized_text in seen_promises:
+            existing = seen_promises[normalized_text]
+            existing["mention_count"] = max(existing["mention_count"], mention_count)
+            existing["source_urls"].update(source_urls)
+            existing["source_count"] = max(existing["source_count"], source_count, len(existing["source_urls"]))
+            continue
+
+        seen_promises[normalized_text] = {
+            "key": promise_key,
+            "mention_count": mention_count,
+            "source_urls": set(source_urls),
+            "source_count": source_count,
+        }
 
     for url in urls:
         try:
-            # Hämta och extrahera text
-            text = await fetch_page_text(url)
-            if not text.strip():
-                errors.append({"url": url, "error": "Ingen text kunde extraheras"})
-                continue
+            pages: list[dict] = []
 
-            # Kör AI-agenten för att hitta vallöften
-            extracted = await extract_promises_from_text(text, party_name, url)
-
-            # Spara varje löfte i databasen
-            for promise in extracted.promises:
-                saved = _add_promise(
-                    db,
-                    party_key,
-                    promise.text,
-                    promise.category,
-                    source_url=url,
-                    source_name=f"{party_name}s hemsida",
+            if crawl:
+                crawl_result = await crawl_site_texts(
+                    url,
+                    max_pages=effective_max_pages_per_url,
+                    max_depth=effective_max_depth,
                 )
-                all_saved.append(saved)
+                crawl_pages = crawl_result.get("pages", [])
+                crawl_errors = crawl_result.get("errors", [])
+                if isinstance(crawl_pages, list):
+                    pages = crawl_pages
+                if isinstance(crawl_errors, list):
+                    for err in crawl_errors:
+                        if isinstance(err, dict):
+                            errors.append(
+                                {
+                                    "url": str(err.get("url", url)),
+                                    "error": str(err.get("error", "Crawl-fel")),
+                                    "stage": "crawl",
+                                }
+                            )
+                if not pages:
+                    errors.append({"url": url, "error": "Crawlern hittade ingen läsbar text", "stage": "crawl"})
+                    continue
+            else:
+                text = await fetch_page_text(url)
+                pages = [{"url": url, "text": text, "depth": 0}]
+
+            for page in pages:
+                page_url = str(page.get("url", url))
+                page_text = str(page.get("text", "") or "")
+                if not page_text.strip():
+                    continue
+
+                pages_processed += 1
+                extracted = await extract_promises_from_text(page_text, party_name, page_url)
+
+                # Spara varje löfte i databasen
+                for promise in extracted.promises:
+                    normalized_text = _normalize_promise_text(promise.text)
+                    if not normalized_text:
+                        continue
+
+                    if normalized_text in seen_promises:
+                        existing = seen_promises[normalized_text]
+                        existing["mention_count"] += 1
+                        if page_url:
+                            existing["source_urls"].add(page_url)
+                        existing["source_count"] = max(existing["source_count"], len(existing["source_urls"]))
+
+                        update_payload = {
+                            "_key": existing["key"],
+                            "mention_count": existing["mention_count"],
+                            "source_urls": sorted(existing["source_urls"]),
+                            "source_count": existing["source_count"],
+                            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                        }
+                        promises_collection.update(update_payload, keep_none=False)
+                        duplicates_skipped += 1
+                        continue
+
+                    source_urls = [page_url] if page_url else []
+                    saved = _add_promise(
+                        db,
+                        party_key,
+                        promise.text,
+                        promise.category,
+                        source_url=page_url,
+                        source_name=f"{party_name}s hemsida",
+                        mention_count=1,
+                        source_urls=source_urls,
+                        source_count=len(source_urls),
+                        last_seen_at=datetime.now(timezone.utc).isoformat(),
+                    )
+                    seen_promises[normalized_text] = {
+                        "key": str(saved.get("_key", "")).strip(),
+                        "mention_count": 1,
+                        "source_urls": set(source_urls),
+                        "source_count": len(source_urls),
+                    }
+                    all_saved.append(saved)
 
         except Exception as e:
-            errors.append({"url": url, "error": str(e)})
+            errors.append({"url": url, "error": str(e), "stage": "extract"})
 
     result = {
         "party": party_name,
+        "crawl": crawl,
+        "max_pages_per_url": effective_max_pages_per_url,
+        "max_depth": effective_max_depth,
         "urls_processed": len(urls),
+        "pages_processed": pages_processed,
         "promises_extracted": len(all_saved),
+        "duplicates_skipped": duplicates_skipped,
         "promises": all_saved,
         "errors": errors,
     }

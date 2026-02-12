@@ -59,7 +59,7 @@ class PromiseInDB(Promise):
 
 class ExtractedPromise(BaseModel):
     """Ett enskilt vallofte extraherat fran en webbsida eller PDF."""
-    text: str = Field(description="Valloftets text, sa nara originalet som mojligt")
+    text: str = Field(description="Kort, konkret och neutral policyformulering baserad pa kalltexten")
     category: str = Field(description="Kategori: Sjukvard, Skola & Utbildning, Rattsvasende, Ekonomi, Skatt, Arbetsmarknad, Socialpolitik, Forsvar, Migration, Klimat & Miljo, Bostader, Infrastruktur, Kultur, Jamstalldhet, EU & Utrikes, Digitalisering, Landsbygd, Ovrigt")
 
 

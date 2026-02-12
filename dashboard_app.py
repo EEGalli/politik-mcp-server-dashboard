@@ -2,9 +2,11 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime
+import threading
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
+from uuid import uuid4
 
 import httpx
 import streamlit as st
@@ -100,6 +102,175 @@ COLLECTION_SORT_FIELDS = {
     "analyses": "analyzed_at",
     "comparisons": "compared_at",
 }
+_APP_ROOT = Path(__file__).resolve().parent
+_SCRAPE_JOB_DIR = _APP_ROOT / ".runtime" / "scrape_jobs"
+_ACTIVE_SCRAPE_JOB_FILE = _SCRAPE_JOB_DIR / "active_scrape_job.json"
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw)
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    except Exception:
+        return None
+
+
+def _is_stale_scrape_job(job: dict[str, Any], max_age_minutes: int = 25) -> bool:
+    status = str(job.get("status", "")).strip().lower()
+    if status not in {"queued", "running"}:
+        return False
+    started_at = _parse_iso_datetime(job.get("started_at"))
+    if started_at is None:
+        started_at = _parse_iso_datetime(job.get("created_at"))
+    if started_at is None:
+        return False
+    age_seconds = (datetime.now(timezone.utc) - started_at).total_seconds()
+
+    timeout_seconds = _coerce_int(job.get("timeout_seconds", 0))
+    if timeout_seconds > 0:
+        # Ge lite marginal ovanpå timeout innan vi klassar jobbet som fastnat.
+        stale_after_seconds = min(7200, max(timeout_seconds + 180, 600))
+        return age_seconds > stale_after_seconds
+
+    return age_seconds > (max_age_minutes * 60)
+
+
+def _job_age_seconds(job: dict[str, Any]) -> int:
+    started_at = _parse_iso_datetime(job.get("started_at"))
+    if started_at is None:
+        started_at = _parse_iso_datetime(job.get("created_at"))
+    if started_at is None:
+        return 0
+    return max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+
+
+def _estimate_scrape_timeout_seconds(
+    urls: list[str],
+    max_pages_per_url: int,
+    max_depth: int,
+) -> int:
+    # Enkel tumregel: fler sidor/djup ger längre timeout, men alltid inom rimliga gränser.
+    safe_urls = max(1, len(urls or []))
+    safe_pages = max(1, int(max_pages_per_url or 1))
+    safe_depth = max(0, int(max_depth or 0))
+    estimated = safe_urls * safe_pages * (20 + (safe_depth * 6))
+    return max(300, min(5400, estimated))
+
+
+def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(f"{path.suffix}.tmp")
+    temp_path.write_text(
+        json.dumps(payload, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+    temp_path.replace(path)
+
+
+def _read_active_scrape_job() -> dict[str, Any] | None:
+    if not _ACTIVE_SCRAPE_JOB_FILE.exists():
+        return None
+    try:
+        raw = _ACTIVE_SCRAPE_JOB_FILE.read_text(encoding="utf-8")
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _set_active_scrape_job(job: dict[str, Any]) -> None:
+    _write_json_file(_ACTIVE_SCRAPE_JOB_FILE, job)
+
+
+def _clear_active_scrape_job() -> None:
+    try:
+        _ACTIVE_SCRAPE_JOB_FILE.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+
+def _spawn_scrape_worker(
+    job_id: str,
+    party_key: str,
+    urls: list[str],
+    crawl: bool,
+    max_pages_per_url: int,
+    max_depth: int,
+) -> None:
+    timeout_seconds = _estimate_scrape_timeout_seconds(
+        urls=urls,
+        max_pages_per_url=max_pages_per_url,
+        max_depth=max_depth,
+    )
+
+    def _worker() -> None:
+        current = _read_active_scrape_job() or {}
+        current.update(
+            {
+                "job_id": job_id,
+                "status": "running",
+                "started_at": _utc_now_iso(),
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        _set_active_scrape_job(current)
+
+        try:
+            raw = asyncio.run(
+                asyncio.wait_for(
+                    mcp_server.scrape_party_promises(
+                        party_key=party_key,
+                        urls=urls,
+                        crawl=crawl,
+                        max_pages_per_url=max_pages_per_url,
+                        max_depth=max_depth,
+                    ),
+                    timeout=timeout_seconds,
+                )
+            )
+            result = _parse_json_result(raw)
+            current = _read_active_scrape_job() or {}
+            if str(current.get("job_id", "")) != job_id:
+                return
+            current.update(
+                {
+                    "status": "completed",
+                    "finished_at": _utc_now_iso(),
+                    "result": result,
+                    "error": "",
+                }
+            )
+            _set_active_scrape_job(current)
+        except Exception as exc:  # pragma: no cover - extern modell/nät
+            current = _read_active_scrape_job() or {}
+            if str(current.get("job_id", "")) != job_id:
+                return
+            error_text = str(exc)
+            if isinstance(exc, TimeoutError):
+                error_text = (
+                    f"Scraping timeout efter {timeout_seconds} sekunder. "
+                    "Kör med färre sidor/lägre djup eller dela upp URL:erna."
+                )
+            current.update(
+                {
+                    "status": "failed",
+                    "finished_at": _utc_now_iso(),
+                    "error": error_text,
+                }
+            )
+            _set_active_scrape_job(current)
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 
 def _db_counts() -> dict[str, int]:
@@ -167,6 +338,549 @@ def _render_db_inspector() -> None:
             st.json(docs)
 
 
+def _coerce_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except Exception:
+        return 0
+
+
+def _count_match_type(rows: list[dict[str, Any]], match_type: str) -> int:
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("match_type", "")).strip().lower() == match_type:
+            return _coerce_int(row.get("count", 0))
+    return 0
+
+
+@st.cache_data(show_spinner=False, ttl=90)
+def _fetch_party_summary(party_key: str) -> dict[str, Any]:
+    db = mcp_server.get_db()
+    query = """
+    LET party = DOCUMENT(CONCAT("parties/", @party_key))
+
+    LET politicians_for_party = (
+        FOR p IN politicians
+            FILTER p.party_key == @party_key
+            SORT p.name ASC
+            RETURN p
+    )
+
+    LET promises_count = LENGTH(
+        FOR pr IN promises
+            FILTER pr.party_key == @party_key
+            RETURN 1
+    )
+
+    LET promises_by_category = (
+        FOR pr IN promises
+            FILTER pr.party_key == @party_key
+            LET category = TRIM(pr.category || "")
+            COLLECT category_name = (category != "" ? category : "Ovrigt") WITH COUNT INTO count
+            SORT count DESC, category_name ASC
+            RETURN {category: category_name, count: count}
+    )
+
+    LET politician_keys = (
+        FOR p IN politicians
+            FILTER p.party_key == @party_key
+            RETURN p._key
+    )
+
+    LET analysis_keys = (
+        FOR a IN analyses
+            FILTER a.politician_key IN politician_keys
+            RETURN a._key
+    )
+
+    LET analyses_count = LENGTH(analysis_keys)
+
+    LET analyses_by_platform = (
+        FOR a IN analyses
+            FILTER a._key IN analysis_keys
+            LET platform = TRIM(a.platform || "")
+            COLLECT platform_name = (platform != "" ? platform : "okänd") WITH COUNT INTO count
+            SORT count DESC, platform_name ASC
+            RETURN {platform: platform_name, count: count}
+    )
+
+    LET analyses_by_category = (
+        FOR a IN analyses
+            FILTER a._key IN analysis_keys
+            LET category = TRIM(a.category || "")
+            COLLECT category_name = (category != "" ? category : "Ovrigt") WITH COUNT INTO count
+            SORT count DESC, category_name ASC
+            RETURN {category: category_name, count: count}
+    )
+
+    LET comparisons_count = LENGTH(
+        FOR c IN comparisons
+            FILTER PARSE_IDENTIFIER(c._from).key IN analysis_keys
+            RETURN 1
+    )
+
+    LET match_types = (
+        FOR c IN comparisons
+            FILTER PARSE_IDENTIFIER(c._from).key IN analysis_keys
+            LET match_type = TRIM(c.match_type || "")
+            COLLECT match_type_name = (match_type != "" ? match_type : "unknown") WITH COUNT INTO count
+            SORT count DESC, match_type_name ASC
+            RETURN {match_type: match_type_name, count: count}
+    )
+
+    LET politician_stats = (
+        FOR p IN politicians
+            FILTER p.party_key == @party_key
+            LET politician_analysis_keys = (
+                FOR a IN analyses
+                    FILTER a.politician_key == p._key
+                    RETURN a._key
+            )
+            LET politician_comparison_count = LENGTH(
+                FOR c IN comparisons
+                    FILTER PARSE_IDENTIFIER(c._from).key IN politician_analysis_keys
+                    RETURN 1
+            )
+            SORT p.name ASC
+            RETURN {
+                politician_key: p._key,
+                name: p.name,
+                analyses_count: LENGTH(politician_analysis_keys),
+                comparisons_count: politician_comparison_count
+            }
+    )
+
+    LET top_promises = (
+        FOR pr IN promises
+            FILTER pr.party_key == @party_key
+            LET normalized_category = TRIM(pr.category || "") != "" ? TRIM(pr.category || "") : "Ovrigt"
+            LET category_weight = FIRST(
+                FOR row IN promises_by_category
+                    FILTER row.category == normalized_category
+                    RETURN row.count
+            ) || 0
+            LET mention_raw = pr.mention_count
+            LET mention_count = (IS_NUMBER(mention_raw) && mention_raw > 0) ? mention_raw : 1
+            LET source_raw = pr.source_count
+            LET inferred_source_count = LENGTH(IS_ARRAY(pr.source_urls) ? pr.source_urls : [])
+                + (TRIM(pr.source_url || "") != "" ? 1 : 0)
+            LET source_count = (IS_NUMBER(source_raw) && source_raw >= 0) ? source_raw : inferred_source_count
+            LET emphasis_score = (mention_count * 100) + (category_weight * 10) + source_count
+            SORT emphasis_score DESC, mention_count DESC, category_weight DESC, source_count DESC, pr.created_at DESC
+            LIMIT 10
+            RETURN {
+                promise_key: pr._key,
+                text: pr.text,
+                category: normalized_category,
+                source_url: pr.source_url,
+                source_count: source_count,
+                created_at: pr.created_at,
+                mention_count: mention_count,
+                category_weight: category_weight,
+                emphasis_score: emphasis_score
+            }
+    )
+
+    RETURN {
+        party: party,
+        politician_count: LENGTH(politicians_for_party),
+        promises_count: promises_count,
+        promises_by_category: promises_by_category,
+        analyses_count: analyses_count,
+        analyses_by_platform: analyses_by_platform,
+        analyses_by_category: analyses_by_category,
+        comparisons_count: comparisons_count,
+        match_types: match_types,
+        politician_stats: politician_stats,
+        top_promises: top_promises
+    }
+    """
+    cursor = db.aql.execute(query, bind_vars={"party_key": party_key})
+    rows = list(cursor)
+    if not rows:
+        return {}
+    return rows[0] if isinstance(rows[0], dict) else {}
+
+
+@st.cache_data(show_spinner=False, ttl=90)
+def _fetch_party_promises_for_category(party_key: str, category: str) -> list[dict[str, Any]]:
+    if not str(party_key or "").strip():
+        return []
+
+    normalized_category = str(category or "").strip()
+    db = mcp_server.get_db()
+    query = """
+    FOR pr IN promises
+        FILTER pr.party_key == @party_key
+        LET normalized = TRIM(pr.category || "")
+        FILTER @category == "Ovrigt"
+            ? (normalized == "" OR normalized == "Ovrigt")
+            : normalized == @category
+        SORT TO_NUMBER(pr.mention_count || 1) DESC, pr.created_at DESC
+        RETURN {
+            promise_key: pr._key,
+            text: pr.text,
+            category: (normalized != "" ? normalized : "Ovrigt"),
+            source_url: pr.source_url,
+            mention_count: TO_NUMBER(pr.mention_count || 1),
+            source_count: TO_NUMBER(pr.source_count || 0),
+            created_at: pr.created_at
+        }
+    """
+    cursor = db.aql.execute(
+        query,
+        bind_vars={"party_key": party_key, "category": normalized_category or "Ovrigt"},
+    )
+    return [row for row in cursor if isinstance(row, dict)]
+
+
+def _extract_selected_row_indices(selection_obj: Any) -> list[int]:
+    rows: list[Any] = []
+    if isinstance(selection_obj, dict):
+        rows = selection_obj.get("selection", {}).get("rows", []) or []
+    else:
+        selection = getattr(selection_obj, "selection", None)
+        if selection is not None:
+            rows = getattr(selection, "rows", []) or []
+
+    selected: list[int] = []
+    for item in rows:
+        try:
+            selected.append(int(item))
+        except Exception:
+            continue
+    return selected
+
+
+def _render_party_tabs() -> None:
+    with st.expander("Partiöversikt (flikar)", expanded=True):
+        refresh_col, _ = st.columns([1, 5])
+        with refresh_col:
+            if st.button("Uppdatera partiöversikt", key="refresh_party_tabs"):
+                _fetch_party_summary.clear()
+                _fetch_party_promises_for_category.clear()
+
+        try:
+            parties_raw = _call_tool(mcp_server.list_parties, {})
+        except Exception as exc:
+            st.error(f"Kunde inte läsa partier: {exc}")
+            return
+
+        parties = [p for p in parties_raw if isinstance(p, dict) and str(p.get("_key", "")).strip()] if isinstance(parties_raw, list) else []
+        if not parties:
+            st.info("Inga partier ännu. Lägg till ett parti först.")
+            return
+
+        parties.sort(key=lambda p: str(p.get("name", "")).lower())
+        labels: list[str] = []
+        for party in parties:
+            name = str(party.get("name", "Okänt parti")).strip() or "Okänt parti"
+            abbreviation = str(party.get("abbreviation", "")).strip()
+            labels.append(f"{name} ({abbreviation})" if abbreviation else name)
+
+        tabs = st.tabs(labels)
+        for tab, party in zip(tabs, parties):
+            with tab:
+                party_key = str(party.get("_key", "")).strip()
+                summary: dict[str, Any] = {}
+                if party_key:
+                    try:
+                        summary = _fetch_party_summary(party_key)
+                    except Exception as exc:
+                        st.error(f"Kunde inte läsa partiöversikt: {exc}")
+                        continue
+
+                party_doc = summary.get("party") if isinstance(summary, dict) else None
+                if not isinstance(party_doc, dict):
+                    party_doc = party
+
+                block = str(party_doc.get("block", "")).strip()
+                website = str(party_doc.get("website_url", "")).strip()
+                if block or website:
+                    details: list[str] = []
+                    if block:
+                        details.append(f"Block: `{block}`")
+                    if website:
+                        details.append(f"Webb: {website}")
+                    st.caption(" • ".join(details))
+
+                politician_count = _coerce_int(summary.get("politician_count", 0))
+                promises_count = _coerce_int(summary.get("promises_count", 0))
+                analyses_count = _coerce_int(summary.get("analyses_count", 0))
+                comparisons_count = _coerce_int(summary.get("comparisons_count", 0))
+                match_rows = summary.get("match_types", [])
+                if not isinstance(match_rows, list):
+                    match_rows = []
+
+                supports_count = _count_match_type(match_rows, "supports")
+                contradicts_count = _count_match_type(match_rows, "contradicts")
+                unrelated_count = _count_match_type(match_rows, "unrelated")
+                supports_share = (supports_count / comparisons_count * 100.0) if comparisons_count > 0 else 0.0
+
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Politiker", politician_count)
+                m2.metric("Vallöften", promises_count)
+                m3.metric("Analyser", analyses_count)
+                m4.metric("Jämförelser", comparisons_count)
+
+                m5, m6, m7, m8 = st.columns(4)
+                m5.metric("Supports", supports_count)
+                m6.metric("Contradicts", contradicts_count)
+                m7.metric("Unrelated", unrelated_count)
+                m8.metric("Stödandel", f"{supports_share:.1f}%")
+
+                split_left, split_right = st.columns(2)
+
+                with split_left:
+                    st.markdown("**Löften per kategori**")
+                    promises_by_category = summary.get("promises_by_category", [])
+                    categories_col, promises_col = st.columns(2)
+                    selected_category = ""
+
+                    with categories_col:
+                        if isinstance(promises_by_category, list) and promises_by_category:
+                            table_key = f"party_promises_category_table_{party_key or 'unknown'}"
+                            selection_state = st.dataframe(
+                                promises_by_category,
+                                hide_index=True,
+                                use_container_width=True,
+                                key=table_key,
+                                on_select="rerun",
+                                selection_mode="single-row",
+                            )
+                            selected_rows = _extract_selected_row_indices(selection_state)
+                            if selected_rows:
+                                selected_index = selected_rows[0]
+                                if 0 <= selected_index < len(promises_by_category):
+                                    selected_row = promises_by_category[selected_index]
+                                    if isinstance(selected_row, dict):
+                                        selected_category = str(selected_row.get("category", "") or "").strip() or "Ovrigt"
+                        else:
+                            st.caption("Inga löften registrerade ännu.")
+
+                    with promises_col:
+                        st.markdown("**Löften i vald kategori**")
+                        if not selected_category:
+                            st.caption("Klicka på en rad i tabellen för att visa löften.")
+                        else:
+                            try:
+                                category_promises = _fetch_party_promises_for_category(party_key, selected_category)
+                            except Exception as exc:
+                                st.error(f"Kunde inte läsa löften för kategori: {exc}")
+                                category_promises = []
+
+                            if category_promises:
+                                st.caption(f"{selected_category} ({len(category_promises)})")
+                                with st.container(height=290, border=True):
+                                    for idx, promise in enumerate(category_promises, start=1):
+                                        text = str(promise.get("text", "") or "").strip()
+                                        source_url = str(promise.get("source_url", "") or "").strip()
+                                        mention_count = _coerce_int(promise.get("mention_count", 1))
+                                        st.markdown(f"**{idx}.** {_promise_short_summary(text)}")
+                                        st.caption(f"Omnämnanden: {mention_count}")
+                                        if source_url:
+                                            st.caption(source_url)
+                                        if idx < len(category_promises):
+                                            st.divider()
+                            else:
+                                st.caption(f"Inga löften hittades i kategorin `{selected_category}`.")
+
+                    st.markdown("**Analyser per kategori**")
+                    analyses_by_category = summary.get("analyses_by_category", [])
+                    if isinstance(analyses_by_category, list) and analyses_by_category:
+                        st.dataframe(analyses_by_category, hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Inga analyser registrerade ännu.")
+
+                with split_right:
+                    st.markdown("**Analyser per plattform**")
+                    analyses_by_platform = summary.get("analyses_by_platform", [])
+                    if isinstance(analyses_by_platform, list) and analyses_by_platform:
+                        st.dataframe(analyses_by_platform, hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Inga plattformsdata ännu.")
+
+                    st.markdown("**Jämförelser per match-typ**")
+                    if match_rows:
+                        st.dataframe(match_rows, hide_index=True, use_container_width=True)
+                    else:
+                        st.caption("Inga jämförelser registrerade ännu.")
+
+                st.markdown("**10 viktigaste löften (partiets egen betoning)**")
+                st.caption("Rangordnas efter hur ofta löftet återkommer i källmaterialet och hur centralt området verkar vara för partiet.")
+                top_promises = summary.get("top_promises", [])
+                if isinstance(top_promises, list) and top_promises:
+                    with st.container(height=340, border=True):
+                        for idx, promise in enumerate(top_promises, start=1):
+                            if not isinstance(promise, dict):
+                                continue
+                            text = str(promise.get("text", "") or "").strip()
+                            category = str(promise.get("category", "") or "").strip() or "Ovrigt"
+                            mention_count = _coerce_int(promise.get("mention_count", 1))
+                            source_count = _coerce_int(promise.get("source_count", 0))
+                            category_weight = _coerce_int(promise.get("category_weight", 0))
+                            source_url = str(promise.get("source_url", "") or "").strip()
+
+                            st.markdown(f"**{idx}. {category}**")
+                            st.write(_promise_short_summary(text))
+                            meta = f"Omnämnanden: {mention_count} • Källor: {source_count} • Kategorityngd: {category_weight}"
+                            st.caption(meta)
+                            if source_url:
+                                st.caption(source_url)
+                            if idx < len(top_promises):
+                                st.divider()
+                else:
+                    st.caption("Inga löften att ranka ännu.")
+
+                st.markdown("**Politiker i partiet**")
+                politician_stats = summary.get("politician_stats", [])
+                if isinstance(politician_stats, list) and politician_stats:
+                    st.dataframe(politician_stats, hide_index=True, use_container_width=True)
+                else:
+                    st.caption("Inga politiker registrerade för partiet ännu.")
+
+
+def _render_scrape_result(result: Any) -> None:
+    if not isinstance(result, dict):
+        st.json(result)
+        return
+
+    promises = result.get("promises", [])
+    errors = result.get("errors", [])
+    pages_processed = _coerce_int(result.get("pages_processed", 0))
+    urls_processed = _coerce_int(result.get("urls_processed", 0))
+    extracted_count = _coerce_int(result.get("promises_extracted", 0))
+    duplicates_skipped = _coerce_int(result.get("duplicates_skipped", 0))
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("URL:er", urls_processed)
+    m2.metric("Sidor", pages_processed)
+    m3.metric("Nya löften", extracted_count)
+    m4.metric("Dubbletter", duplicates_skipped)
+    m5.metric("Fel", len(errors) if isinstance(errors, list) else 0)
+
+    if isinstance(promises, list) and promises:
+        st.markdown("**Löften (i ordningen de hittades)**")
+        st.caption("Visas som korta utdrag ur originaltexten för att vara enkla men sanningsenliga.")
+        with st.container(height=420, border=True):
+            total = len(promises)
+            for idx, promise in enumerate(promises, start=1):
+                if not isinstance(promise, dict):
+                    continue
+                promise_text = str(promise.get("text", "")).strip()
+                short_summary = _promise_short_summary(promise_text)
+                category = str(promise.get("category", "")).strip() or "Ovrigt"
+                source_url = str(promise.get("source_url", "")).strip()
+                header = f"**{idx}/{total} · {category}**"
+                st.markdown(header)
+                st.write(short_summary or "(tomt löfte)")
+                if promise_text and short_summary and promise_text != short_summary:
+                    with st.expander("Visa originaltext", expanded=False):
+                        st.write(promise_text)
+                if source_url:
+                    st.caption(source_url)
+                if idx < total:
+                    st.divider()
+    else:
+        st.info("Inga nya löften extraherades i den senaste körningen.")
+
+    if isinstance(errors, list) and errors:
+        with st.expander(f"Fel ({len(errors)})", expanded=False):
+            st.json(errors)
+
+    with st.expander("Rått resultat (JSON)", expanded=False):
+        st.json(result)
+
+
+def _compact_whitespace(text: str) -> str:
+    return re.sub(r"\s+", " ", str(text or "")).strip()
+
+
+def _promise_short_summary(text: str, max_chars: int = 220) -> str:
+    """
+    Skapa en kort och sanningsenlig sammanfattning genom att ta ett utdrag
+    ur originaltexten (ingen fri omformulering).
+    """
+    cleaned = _compact_whitespace(text)
+    if not cleaned:
+        return ""
+    if len(cleaned) <= max_chars:
+        return cleaned
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", cleaned) if s.strip()]
+
+    for sentence in sentences:
+        if len(sentence) > max_chars:
+            continue
+        if re.search(r"\d", sentence):
+            return sentence
+
+    for sentence in sentences:
+        if 40 <= len(sentence) <= max_chars:
+            return sentence
+
+    clipped = cleaned[:max_chars].rstrip(" ,;:-")
+    return f"{clipped}..."
+
+
+def _fetch_party_promises_live(party_key: str) -> list[dict[str, Any]]:
+    if not str(party_key or "").strip():
+        return []
+    try:
+        payload = _call_tool(
+            mcp_server.get_promises,
+            {"party_key": str(party_key).strip(), "category": ""},
+        )
+    except Exception:
+        return []
+    if not isinstance(payload, list):
+        return []
+    rows = [row for row in payload if isinstance(row, dict)]
+    rows.sort(
+        key=lambda row: str(row.get("created_at", "") or ""),
+        reverse=True,
+    )
+    return rows
+
+
+def _render_live_promises_panel(
+    party_key: str,
+    baseline_count: int = 0,
+    max_items: int = 30,
+) -> None:
+    promises = _fetch_party_promises_live(party_key)
+    total = len(promises)
+    new_since_start = max(0, total - max(0, int(baseline_count or 0)))
+
+    st.markdown("**Löften hittills i databasen**")
+    k1, k2 = st.columns(2)
+    k1.metric("Totalt", total)
+    k2.metric("Nya i denna körning", new_since_start)
+
+    if not promises:
+        st.caption("Inga löften sparade ännu.")
+        return
+
+    with st.container(height=320, border=True):
+        for idx, promise in enumerate(promises[:max_items], start=1):
+            text = str(promise.get("text", "") or "").strip()
+            category = str(promise.get("category", "") or "").strip() or "Ovrigt"
+            source = str(promise.get("source_url", "") or "").strip()
+            created = str(promise.get("created_at", "") or "").strip()
+            st.markdown(f"**{idx}. {category}**")
+            st.write(_promise_short_summary(text))
+            meta_bits: list[str] = []
+            if source:
+                meta_bits.append(source)
+            if created:
+                meta_bits.append(created)
+            if meta_bits:
+                st.caption(" • ".join(meta_bits))
+            if idx < min(len(promises), max_items):
+                st.divider()
+
+
 TOOL_MAP: dict[str, tuple[Callable, bool]] = {
     "add_party": (mcp_server.add_party, False),
     "list_parties": (mcp_server.list_parties, False),
@@ -214,7 +928,13 @@ def _tool_schema_text(allowed_tools: set[str]) -> str:
         "add_promise": {"party_key": "str", "text": "str", "category": "str", "source_url": "str", "source_name": "str", "date": "str"},
         "get_promises": {"party_key": "str", "category": "str"},
         "delete_promise": {"promise_key": "str"},
-        "scrape_party_promises": {"party_key": "str", "urls": ["str"]},
+        "scrape_party_promises": {
+            "party_key": "str",
+            "urls": ["str"],
+            "crawl": "bool",
+            "max_pages_per_url": "int",
+            "max_depth": "int",
+        },
         "save_analysis": {"politician_key": "str", "video_file": "str", "transcription": "str", "summary": "str", "category": "str", "political_color": "str", "platform": "str"},
         "search_analyses": {"politician_key": "str", "category": "str", "platform": "str", "search_text": "str"},
         "compare_content_vs_promise": {"analysis_key": "str", "promise_key": "str"},
@@ -498,6 +1218,7 @@ def _init_chat_state() -> None:
         st.session_state["chat_messages"] = [
             {"role": "system", "content": CHAT_SYSTEM_PROMPT}
         ]
+    st.session_state.setdefault("chat_widget_open", False)
 
 
 def _chat_with_ollama(messages: list[dict[str, str]]) -> str:
@@ -528,72 +1249,135 @@ def _messages_for_request() -> list[dict[str, str]]:
 
 
 def _render_local_chat() -> None:
-    st.subheader("Lokal chatt (Qwen via Ollama)")
-    top_left, top_right = st.columns([4, 1])
-    with top_left:
-        st.caption(f"Host: `{OLLAMA_HOST}`  •  Modell: `{CHAT_MODEL}`")
-    with top_right:
-        if st.button("Nytt samtal", use_container_width=True):
+    st.markdown(
+        """
+        <style>
+        div[data-testid="stVerticalBlock"]:has(#chat-open-panel-anchor) [data-testid="stVerticalBlockBorderWrapper"] {
+            background-color: #ffffff !important;
+            opacity: 1 !important;
+            backdrop-filter: none !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not bool(st.session_state.get("chat_widget_open", False)):
+        if st.button("💬 Öppna chatt", key="chat_widget_open_button", use_container_width=True):
+            st.session_state["chat_widget_open"] = True
+            st.rerun()
+        return
+
+    with st.container(border=True):
+        st.markdown('<div id="chat-open-panel-anchor"></div>', unsafe_allow_html=True)
+        top_left, top_mid, top_right = st.columns([3, 1, 1])
+        with top_left:
+            st.caption(f"Qwen assistent • `{CHAT_MODEL}`")
+        with top_mid:
+            reset_clicked = st.button("Nytt", use_container_width=True, key="chat_reset_button")
+        with top_right:
+            minimize_clicked = st.button("Minimera", use_container_width=True, key="chat_minimize_button")
+
+        if minimize_clicked:
+            st.session_state["chat_widget_open"] = False
+            st.rerun()
+        if reset_clicked:
             st.session_state["chat_messages"] = [
                 {"role": "system", "content": CHAT_SYSTEM_PROMPT}
             ]
             st.rerun()
 
-    agent_mode_col, write_mode_col = st.columns(2)
-    with agent_mode_col:
-        agent_mode = st.toggle("Agentläge (Qwen kan anropa MCP-tools)", value=True, key="chat_agent_mode")
-    with write_mode_col:
-        allow_writes = st.toggle("Tillåt databasändringar", value=True, key="chat_agent_allow_writes")
+        with st.expander("Inställningar", expanded=False):
+            agent_mode_col, write_mode_col = st.columns(2)
+            with agent_mode_col:
+                agent_mode = st.toggle("Agentläge", value=True, key="chat_agent_mode")
+            with write_mode_col:
+                allow_writes = st.toggle("Tillåt skrivning", value=True, key="chat_agent_allow_writes")
+            st.caption(f"Host: `{OLLAMA_HOST}`")
 
-    for message in st.session_state["chat_messages"]:
-        role = str(message.get("role", "")).strip()
-        content = str(message.get("content", "")).strip()
-        if role == "system" or not content:
-            continue
-        with st.chat_message("assistant" if role == "assistant" else "user"):
-            st.markdown(content)
+        with st.container(height=360, border=True):
+            for message in st.session_state["chat_messages"]:
+                role = str(message.get("role", "")).strip()
+                content = str(message.get("content", "")).strip()
+                if role == "system" or not content:
+                    continue
+                with st.chat_message("assistant" if role == "assistant" else "user"):
+                    st.markdown(content)
+                    if role == "assistant":
+                        actions = message.get("actions", [])
+                        if isinstance(actions, list) and actions:
+                            with st.expander(f"Agentsteg ({len(actions)})", expanded=False):
+                                st.json(actions)
 
-    prompt = st.chat_input("Skriv till Qwen...")
+        with st.form("local_chat_form", clear_on_submit=True):
+            prompt = st.text_area(
+                "Meddelande",
+                value="",
+                height=90,
+                label_visibility="collapsed",
+                placeholder="Skriv till Qwen...",
+            )
+            send = st.form_submit_button("Skicka", use_container_width=True)
+
+    if not send:
+        return
+
+    prompt = str(prompt or "").strip()
     if not prompt:
         return
 
+    agent_mode = bool(st.session_state.get("chat_agent_mode", True))
+    allow_writes = bool(st.session_state.get("chat_agent_allow_writes", True))
+
     st.session_state["chat_messages"].append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
 
-    with st.chat_message("assistant"):
-        with st.spinner("Qwen svarar..."):
-            try:
-                if agent_mode:
-                    agent_result = _run_qwen_tool_agent(prompt, allow_writes=allow_writes)
-                    reply = str(agent_result.get("answer", "")).strip() or "Klart."
-                    actions = agent_result.get("actions", [])
-                    if actions:
-                        with st.expander(f"Agentsteg ({len(actions)})", expanded=False):
-                            st.json(actions)
-                else:
-                    reply = _chat_with_ollama(_messages_for_request())
-            except Exception as exc:
-                reply = f"Kunde inte nå Ollama på {OLLAMA_HOST}. Fel: {exc}"
-        st.markdown(reply)
+    actions: list[Any] = []
+    with st.spinner("Qwen svarar..."):
+        try:
+            if agent_mode:
+                agent_result = _run_qwen_tool_agent(prompt, allow_writes=allow_writes)
+                reply = str(agent_result.get("answer", "")).strip() or "Klart."
+                raw_actions = agent_result.get("actions", [])
+                if isinstance(raw_actions, list):
+                    actions = raw_actions
+            else:
+                reply = _chat_with_ollama(_messages_for_request())
+        except Exception as exc:
+            reply = f"Kunde inte nå Ollama på {OLLAMA_HOST}. Fel: {exc}"
 
-    st.session_state["chat_messages"].append({"role": "assistant", "content": reply})
-
-
-_init_chat_state()
-_render_local_chat()
-st.divider()
+    assistant_message: dict[str, Any] = {"role": "assistant", "content": reply}
+    if actions:
+        assistant_message["actions"] = actions
+    st.session_state["chat_messages"].append(assistant_message)
+    st.rerun()
 
 with st.expander("Snabbflöde: Parti + scraping", expanded=True):
+    try:
+        parties = _call_tool(mcp_server.list_parties, {})
+    except Exception:
+        parties = []
+
+    party_options = {
+        f"{p.get('name', '')} ({p.get('abbreviation', '')}) [{p.get('_key', '')}]": p.get("_key", "")
+        for p in (parties if isinstance(parties, list) else [])
+        if p.get("_key")
+    }
+    party_placeholder = "Välj parti..."
+    party_select_options = (
+        [party_placeholder] + list(party_options.keys())
+        if party_options
+        else ["(inga partier ännu)"]
+    )
+
     col1, col2 = st.columns(2)
 
     with col1:
         st.subheader("1) Lägg till parti")
         with st.form("add_party_form"):
-            party_name = st.text_input("Partinamn", value="Socialdemokraterna")
-            abbreviation = st.text_input("Förkortning", value="S")
-            block = st.text_input("Block", value="vänster")
-            website_url = st.text_input("Webbplats", value="https://www.socialdemokraterna.se")
+            party_name = st.text_input("Partinamn", value="")
+            abbreviation = st.text_input("Förkortning", value="")
+            block = st.text_input("Block", value="")
+            website_url = st.text_input("Webbplats", value="")
             add_party_submit = st.form_submit_button("Lägg till parti")
 
         if add_party_submit:
@@ -612,46 +1396,169 @@ with st.expander("Snabbflöde: Parti + scraping", expanded=True):
             except Exception as exc:
                 st.error(f"Kunde inte lägga till parti: {exc}")
 
+        st.subheader("2) Lägg till politiker")
+        if not party_options:
+            st.caption("Lägg till minst ett parti först.")
+        with st.form("add_politician_form", clear_on_submit=True):
+            politician_name = st.text_input("Namn", value="")
+            politician_party_label = st.selectbox(
+                "Parti",
+                options=party_select_options,
+                index=0,
+                key="quick_add_politician_party",
+            )
+            tiktok_handle = st.text_input("TikTok (valfritt)", value="")
+            instagram_handle = st.text_input("Instagram (valfritt)", value="")
+            twitter_handle = st.text_input("X/Twitter (valfritt)", value="")
+            add_politician_submit = st.form_submit_button(
+                "Lägg till politiker",
+                disabled=not bool(party_options),
+            )
+
+        if add_politician_submit:
+            selected_party_for_politician = party_options.get(politician_party_label, "")
+            if not str(politician_name or "").strip():
+                st.warning("Fyll i politikerns namn.")
+            elif not selected_party_for_politician:
+                st.warning("Välj parti för politikern.")
+            else:
+                try:
+                    result = _call_tool(
+                        mcp_server.add_politician,
+                        {
+                            "name": str(politician_name).strip(),
+                            "party_key": str(selected_party_for_politician).strip(),
+                            "tiktok": str(tiktok_handle).strip(),
+                            "instagram": str(instagram_handle).strip(),
+                            "twitter": str(twitter_handle).strip(),
+                        },
+                    )
+                    st.success("Politiker sparad")
+                    st.json(result)
+                except Exception as exc:
+                    st.error(f"Kunde inte lägga till politiker: {exc}")
+
     with col2:
-        st.subheader("2) Skrapa vallöften")
-        try:
-            parties = _call_tool(mcp_server.list_parties, {})
-        except Exception:
-            parties = []
-
-        party_options = {
-            f"{p.get('name', '')} ({p.get('abbreviation', '')}) [{p.get('_key', '')}]": p.get("_key", "")
-            for p in (parties if isinstance(parties, list) else [])
-            if p.get("_key")
-        }
-
+        st.subheader("3) Skrapa vallöften")
         selected_label = st.selectbox(
             "Välj parti",
-            options=list(party_options.keys()) if party_options else ["(inga partier ännu)"],
+            options=party_select_options,
+            index=0,
+            key="quick_scrape_selected_party",
         )
         selected_party_key = party_options.get(selected_label, "")
 
         urls_text = st.text_area(
             "URL:er (en per rad)",
-            value="https://www.socialdemokraterna.se/var-politik",
+            value="",
             height=120,
         )
+        crawl_enabled = st.checkbox(
+            "Crawla interna undersidor automatiskt",
+            value=True,
+            key="quick_scrape_crawl_enabled",
+        )
+        scrape_col1, scrape_col2 = st.columns(2)
+        with scrape_col1:
+            max_pages_per_url = st.slider(
+                "Max sidor per URL",
+                min_value=1,
+                max_value=80,
+                value=25,
+                step=1,
+                key="quick_scrape_max_pages_per_url",
+            )
+        with scrape_col2:
+            max_depth = st.slider(
+                "Max länkdjup",
+                min_value=0,
+                max_value=4,
+                value=2,
+                step=1,
+                key="quick_scrape_max_depth",
+            )
 
-        if st.button("Skrapa och spara löften", disabled=not bool(selected_party_key)):
+        active_scrape_job = _read_active_scrape_job()
+        if isinstance(active_scrape_job, dict):
+            job_status = str(active_scrape_job.get("status", "")).strip().lower()
+            if _is_stale_scrape_job(active_scrape_job):
+                started_raw = str(active_scrape_job.get("started_at", "") or active_scrape_job.get("created_at", "")).strip()
+                if started_raw:
+                    st.warning(f"Ett tidigare scrapingjobb verkar ha fastnat (start: {started_raw}). Jobblåset återställs.")
+                else:
+                    st.warning("Ett tidigare scrapingjobb verkar ha fastnat. Jobblåset återställs.")
+                _clear_active_scrape_job()
+                active_scrape_job = None
+            elif job_status in {"completed", "failed"}:
+                if job_status == "completed":
+                    result_payload = active_scrape_job.get("result")
+                    if isinstance(result_payload, dict):
+                        st.session_state["last_scrape_result"] = result_payload
+                        st.success("Bakgrundsjobb klart: vallöften är uppdaterade.")
+                else:
+                    st.error(f"Bakgrundsjobb misslyckades: {active_scrape_job.get('error', 'okänt fel')}")
+                _clear_active_scrape_job()
+                active_scrape_job = None
+
+        active_is_running = isinstance(active_scrape_job, dict) and str(active_scrape_job.get("status", "")).strip().lower() in {"queued", "running"}
+        if active_is_running:
+            running_since = str(active_scrape_job.get("started_at", "") or active_scrape_job.get("created_at", "")).strip()
+            running_age_seconds = _job_age_seconds(active_scrape_job)
+            timeout_seconds = _coerce_int(active_scrape_job.get("timeout_seconds", 0))
+            st.info("Scraping körs i bakgrunden. Du kan refresha sidan utan att avbryta jobbet.")
+            if running_since:
+                st.caption(f"Startad: `{running_since}`")
+            if running_age_seconds > 0:
+                elapsed_minutes = running_age_seconds // 60
+                if timeout_seconds > 0:
+                    timeout_minutes = max(1, timeout_seconds // 60)
+                    st.caption(f"Körtid: `{elapsed_minutes} min` • Timeout: `{timeout_minutes} min`")
+                    if running_age_seconds > timeout_seconds:
+                        st.warning("Jobbet har passerat timeout och kan vara fastnat. Återställ och kör igen med lägre crawl-gränser.")
+                else:
+                    st.caption(f"Körtid: `{elapsed_minutes} min`")
+            if st.button("Återställ låst scrapingjobb", key="clear_active_scrape_job"):
+                _clear_active_scrape_job()
+                st.rerun()
+            active_party_key = str(active_scrape_job.get("party_key", "") or "").strip()
+            baseline_count = _coerce_int(active_scrape_job.get("baseline_promises_count", 0))
+            if active_party_key:
+                _render_live_promises_panel(active_party_key, baseline_count=baseline_count)
+
+        if st.button("Skrapa och spara löften", disabled=(not bool(selected_party_key) or active_is_running)):
             urls = [line.strip() for line in urls_text.splitlines() if line.strip()]
             if not urls:
                 st.warning("Lägg till minst en URL")
             else:
                 try:
-                    result = _call_tool(
-                        mcp_server.scrape_party_promises,
-                        {"party_key": selected_party_key, "urls": urls},
-                        is_async=True,
+                    job_id = uuid4().hex
+                    existing_promises = _fetch_party_promises_live(selected_party_key)
+                    job = {
+                        "job_id": job_id,
+                        "status": "queued",
+                        "created_at": _utc_now_iso(),
+                        "party_key": selected_party_key,
+                        "baseline_promises_count": len(existing_promises),
+                        "urls": urls,
+                        "crawl": bool(crawl_enabled),
+                        "max_pages_per_url": int(max_pages_per_url),
+                        "max_depth": int(max_depth),
+                    }
+                    _set_active_scrape_job(job)
+                    _spawn_scrape_worker(
+                        job_id=job_id,
+                        party_key=selected_party_key,
+                        urls=urls,
+                        crawl=bool(crawl_enabled),
+                        max_pages_per_url=int(max_pages_per_url),
+                        max_depth=int(max_depth),
                     )
-                    st.success("Scraping klar")
-                    st.json(result)
+                    st.info("Scraping startad i bakgrunden.")
                 except Exception as exc:
                     st.error(f"Scraping misslyckades: {exc}")
+
+        if "last_scrape_result" in st.session_state:
+            _render_scrape_result(st.session_state["last_scrape_result"])
 
 
 with st.expander("Video -> Match mot partiets politik", expanded=True):
@@ -757,6 +1664,8 @@ with st.expander("Video -> Match mot partiets politik", expanded=True):
                 st.error(f"Video-matchning misslyckades: {exc}")
 
 
+_render_party_tabs()
+
 with st.expander("Snabbvisning: partier, löften, politiker", expanded=True):
     c1, c2, c3 = st.columns(3)
 
@@ -793,7 +1702,7 @@ st.subheader(f"Tool Playground (alla {len(TOOL_MAP)} tools)")
 
 selected_tool = st.selectbox("Tool", options=list(TOOL_MAP.keys()))
 default_payloads = {
-    "add_party": {"name": "Socialdemokraterna", "abbreviation": "S", "block": "vänster", "website_url": "https://www.socialdemokraterna.se"},
+    "add_party": {"name": "", "abbreviation": "", "block": "", "website_url": ""},
     "list_parties": {},
     "get_party_details": {"party_key": ""},
     "add_politician": {"name": "", "party_key": "", "tiktok": "", "instagram": "", "twitter": ""},
@@ -802,7 +1711,13 @@ default_payloads = {
     "add_promise": {"party_key": "", "text": "", "category": "", "source_url": "", "source_name": "", "date": ""},
     "get_promises": {"party_key": "", "category": ""},
     "delete_promise": {"promise_key": ""},
-    "scrape_party_promises": {"party_key": "", "urls": ["https://www.socialdemokraterna.se/var-politik"]},
+    "scrape_party_promises": {
+        "party_key": "",
+        "urls": [],
+        "crawl": True,
+        "max_pages_per_url": 25,
+        "max_depth": 2,
+    },
     "save_analysis": {"politician_key": "", "video_file": "", "transcription": "", "summary": "", "category": "", "political_color": "", "platform": ""},
     "search_analyses": {"politician_key": "", "category": "", "platform": "", "search_text": ""},
     "compare_content_vs_promise": {"analysis_key": "", "promise_key": ""},
@@ -826,3 +1741,6 @@ if st.button("Kör tool"):
         st.error(f"Tool-körning misslyckades: {exc}")
 
 st.caption("Tips: Starta med add_party -> scrape_party_promises -> get_promises -> add_politician -> save_analysis -> compare_content_vs_promise -> get_consistency_report")
+
+_init_chat_state()
+_render_local_chat()

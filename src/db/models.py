@@ -39,8 +39,12 @@ COLLECTIONS = {
             "text": str,            # Löftets text
             "category": str,        # "Skola", "Sjukvård", etc.
             "source_url": str,      # Varifrån löftet hämtades
+            "source_urls": list,    # Alla käll-URL:er där samma löfte hittats
+            "source_count": int,    # Antal unika käll-URL:er för löftet
             "source_name": str,     # "Valmanifest 2022"
             "date": str,            # "2022-09-01"
+            "mention_count": int,   # Hur många gånger löftet återkommit vid insamling
+            "last_seen_at": str,    # Senaste gång löftet observerades i källmaterial
             "created_at": str,
         },
     },

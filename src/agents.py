@@ -8,8 +8,10 @@ Inga API-nycklar kravs.
 import json
 import os
 import re
+from collections import deque
 from functools import lru_cache
 from html.parser import HTMLParser
+from urllib.parse import urldefrag, urljoin, urlparse, urlunparse
 
 import fitz  # PyMuPDF
 import httpx
@@ -64,6 +66,22 @@ class _HTMLTextExtractor(HTMLParser):
         return "".join(self._result).strip()
 
 
+class _HTMLLinkExtractor(HTMLParser):
+    """Enkel länkextraktor för att crawla interna undersidor."""
+
+    def __init__(self):
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag != "a":
+            return
+        for key, value in attrs:
+            if key == "href" and value:
+                self.links.append(str(value))
+                return
+
+
 def _html_to_text(html: str) -> str:
     """Konvertera HTML till ren text."""
     parser = _HTMLTextExtractor()
@@ -81,17 +99,245 @@ def _pdf_to_text(pdf_bytes: bytes) -> str:
     return "\n".join(text_parts)
 
 
+_SKIP_LINK_PREFIXES = (
+    "javascript:",
+    "mailto:",
+    "tel:",
+    "#",
+)
+
+_SKIP_FILE_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".gif",
+    ".svg",
+    ".webp",
+    ".ico",
+    ".css",
+    ".js",
+    ".json",
+    ".xml",
+    ".txt",
+    ".zip",
+    ".rar",
+    ".7z",
+    ".mp3",
+    ".wav",
+    ".mp4",
+    ".mov",
+    ".avi",
+    ".mkv",
+    ".webm",
+}
+
+_SKIP_PATH_SUBSTRINGS = (
+    "/wp-json/",
+    "/wp-admin/",
+    "/feed",
+    "/sitemap",
+    "/tag/",
+    "/author/",
+    "/search",
+    "/kommentar",
+    "/comment",
+    "/konto",
+    "/account",
+    "/login",
+)
+
+_MAX_ENQUEUED_URLS = 800
+_MAX_LINKS_PER_PAGE = 180
+
+
+def _canonicalize_url(raw_url: str, keep_query: bool = True) -> str:
+    cleaned = str(raw_url or "").strip()
+    if not cleaned:
+        return ""
+
+    cleaned, _ = urldefrag(cleaned)
+    parsed = urlparse(cleaned)
+    if parsed.scheme not in {"http", "https"}:
+        return ""
+    if not parsed.netloc:
+        return ""
+
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = parsed.path or "/"
+    path = re.sub(r"/{2,}", "/", path)
+    if path != "/" and path.endswith("/"):
+        path = path[:-1]
+
+    query = parsed.query if keep_query else ""
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def _scope_prefix_from_seed(path: str) -> str:
+    parts = [part for part in str(path or "").split("/") if part]
+    if not parts:
+        return "/"
+    return f"/{parts[0]}/"
+
+
+def _extract_links_from_html(html: str, base_url: str) -> list[str]:
+    parser = _HTMLLinkExtractor()
+    parser.feed(html)
+    absolute_links: list[str] = []
+    for href in parser.links:
+        link = str(href or "").strip()
+        if not link:
+            continue
+        lowered = link.lower()
+        if lowered.startswith(_SKIP_LINK_PREFIXES):
+            continue
+        absolute_links.append(urljoin(base_url, link))
+    return absolute_links
+
+
+def _is_allowed_crawl_target(url: str, seed_domain: str, scope_prefix: str) -> bool:
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if parsed.netloc.lower() != seed_domain.lower():
+        return False
+    if parsed.query:
+        return False
+
+    path = parsed.path or "/"
+    if scope_prefix != "/":
+        scope_no_trailing = scope_prefix[:-1] if scope_prefix.endswith("/") else scope_prefix
+        if not (path == scope_no_trailing or path.startswith(scope_prefix)):
+            return False
+
+    lowered_path = path.lower()
+    for marker in _SKIP_PATH_SUBSTRINGS:
+        if marker in lowered_path:
+            return False
+    for ext in _SKIP_FILE_EXTENSIONS:
+        if lowered_path.endswith(ext):
+            return False
+
+    return True
+
+
+async def _fetch_page_payload(client: httpx.AsyncClient, url: str) -> dict:
+    response = await client.get(url)
+    response.raise_for_status()
+
+    final_url = str(response.url)
+    content_type = str(response.headers.get("content-type", "")).lower()
+    is_pdf = "pdf" in content_type or final_url.lower().endswith(".pdf")
+
+    if is_pdf:
+        text = _pdf_to_text(response.content)
+        return {
+            "url": final_url,
+            "content_type": content_type,
+            "text": text,
+            "links": [],
+        }
+
+    html = response.text
+    return {
+        "url": final_url,
+        "content_type": content_type,
+        "text": _html_to_text(html),
+        "links": _extract_links_from_html(html, final_url),
+    }
+
+
 async def fetch_page_text(url: str) -> str:
     """Hamta text fran en URL (HTML eller PDF)."""
     async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
-        response = await client.get(url)
-        response.raise_for_status()
+        payload = await _fetch_page_payload(client, url)
+    return str(payload.get("text", ""))
 
-    content_type = response.headers.get("content-type", "")
 
-    if "pdf" in content_type or url.lower().endswith(".pdf"):
-        return _pdf_to_text(response.content)
-    return _html_to_text(response.text)
+async def crawl_site_texts(
+    start_url: str,
+    max_pages: int = 25,
+    max_depth: int = 2,
+) -> dict:
+    """
+    Crawla en site från start-URL och hämta text från interna undersidor.
+
+    Returnerar:
+      {
+        "pages": [{"url": "...", "text": "...", "depth": 0}, ...],
+        "errors": [{"url": "...", "error": "..."}]
+      }
+    """
+    max_pages = max(1, min(int(max_pages or 1), 80))
+    max_depth = max(0, min(int(max_depth or 0), 5))
+
+    seed_url = _canonicalize_url(start_url, keep_query=False)
+    if not seed_url:
+        return {"pages": [], "errors": [{"url": start_url, "error": "Ogiltig start-URL"}]}
+
+    seed_parsed = urlparse(seed_url)
+    seed_domain = seed_parsed.netloc
+    scope_prefix = _scope_prefix_from_seed(seed_parsed.path)
+    if scope_prefix == "/":
+        # Säkerhetsläge: om seed ligger på domänroten, följ inte vidare länkar.
+        max_depth = 0
+
+    queue: deque[tuple[str, int]] = deque([(seed_url, 0)])
+    enqueued: set[str] = {seed_url}
+    visited: set[str] = set()
+    pages: list[dict] = []
+    errors: list[dict] = []
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=30) as client:
+        while queue and len(pages) < max_pages:
+            current_url, depth = queue.popleft()
+            if current_url in visited:
+                continue
+            visited.add(current_url)
+
+            try:
+                payload = await _fetch_page_payload(client, current_url)
+            except Exception as exc:
+                errors.append({"url": current_url, "error": str(exc)})
+                continue
+
+            final_url = _canonicalize_url(str(payload.get("url", current_url)), keep_query=False)
+            page_text = str(payload.get("text", "") or "").strip()
+            if page_text:
+                pages.append(
+                    {
+                        "url": final_url or current_url,
+                        "text": page_text,
+                        "depth": depth,
+                    }
+                )
+
+            if depth >= max_depth:
+                continue
+
+            links = payload.get("links", [])
+            if not isinstance(links, list):
+                continue
+
+            links_seen_on_page = 0
+            for raw_link in links:
+                if links_seen_on_page >= _MAX_LINKS_PER_PAGE:
+                    break
+                if len(enqueued) >= _MAX_ENQUEUED_URLS:
+                    break
+
+                candidate = _canonicalize_url(str(raw_link), keep_query=False)
+                if not candidate:
+                    continue
+                if candidate in visited or candidate in enqueued:
+                    continue
+                if not _is_allowed_crawl_target(candidate, seed_domain=seed_domain, scope_prefix=scope_prefix):
+                    continue
+                queue.append((candidate, depth + 1))
+                enqueued.add(candidate)
+                links_seen_on_page += 1
+
+    return {"pages": pages, "errors": errors}
 
 
 # -- Gemensamma prompts -------------------------------------------
@@ -118,10 +364,14 @@ _SCRAPE_INSTRUCTIONS = """Du ar en expert pa att identifiera konkreta politiska 
 
 Regler:
 - Extrahera BARA konkreta loften (specifika ataganden, inte vaga visioner)
-- Anvand texten sa nara originalet som mojligt -- hitta INTE pa egna formuleringar
+- Omformulera till enkel, neutral policiesvenska utan partislogans och vag retorik.
+- Hitta INTE pa nya sakuppgifter. Behall endast det som faktiskt star i kallan.
+- Om texten beskriver malbild men inte metod (t.ex. "fler ska kunna..." utan hur), ta inte med den.
+- Om metod finns i bisats (t.ex. "genom ...", "via ...", "med ..."), lyft fram metoden som huvudatgard.
 - Om texten inte innehaller nagra konkreta loften, returnera en tom lista
 - Behall siffror, procentsatser, datum, malnivaer och andra konkreta detaljer om de finns.
 - Skippa slogans, visioner och allmanna mal utan tydlig atgard.
+- Svara ALLTID pa svenska.
 - Kategorisera varje lofte med en av dessa kategorier:
   Sjukvard, Skola & Utbildning, Rattsvasende, Ekonomi, Skatt,
   Arbetsmarknad, Socialpolitik, Forsvar, Migration, Klimat & Miljo,
@@ -137,6 +387,36 @@ Exempel pa saker som INTE ar loften:
 - "Trygghet ar viktigt"                     (allmant uttalande)
 
 Svara alltid pa svenska."""
+
+_CATEGORY_MAP_TO_SWEDISH = {
+    "healthcare": "Sjukvard",
+    "health care": "Sjukvard",
+    "education": "Skola & Utbildning",
+    "school": "Skola & Utbildning",
+    "law and order": "Rattsvasende",
+    "justice": "Rattsvasende",
+    "economy": "Ekonomi",
+    "tax": "Skatt",
+    "taxes": "Skatt",
+    "labor market": "Arbetsmarknad",
+    "employment": "Arbetsmarknad",
+    "social policy": "Socialpolitik",
+    "defense": "Forsvar",
+    "defence": "Forsvar",
+    "migration": "Migration",
+    "climate": "Klimat & Miljo",
+    "environment": "Klimat & Miljo",
+    "housing": "Bostader",
+    "infrastructure": "Infrastruktur",
+    "culture": "Kultur",
+    "gender equality": "Jamstalldhet",
+    "eu and foreign policy": "EU & Utrikes",
+    "foreign policy": "EU & Utrikes",
+    "digitalization": "Digitalisering",
+    "digitalisation": "Digitalisering",
+    "rural policy": "Landsbygd",
+    "other": "Ovrigt",
+}
 
 
 # -- Agent-byggare ------------------------------------------------
@@ -252,57 +532,18 @@ def _extract_first_json_object(raw: str) -> dict | None:
     return None
 
 
-_GENERIC_PROMISE_PATTERNS = [
-    "vi vill ha",
-    "vi tror pa",
-    "vi tror att",
-    "det ar viktigt",
-    "trygghet ar viktigt",
-    "ett starkt sverige",
-    "for ett battre",
-    "vi prioriterar",
-    "vi arbetar for",
-]
+def _normalize_category_label(category: str) -> str:
+    cleaned = str(category or "").strip()
+    if not cleaned:
+        return "Ovrigt"
 
-_COMMITMENT_MARKERS = [
-    "ska ",
-    "kommer att",
-    "vi vill ",
-    "genom att",
-    "genomfora",
-    "infors",
-    "infora",
-    "avskaffa",
-    "forbjuda",
-    "sanka",
-    "hoja",
-    "starka",
-    "utoka",
-    "bygga ut",
-    "garantera",
-]
+    key = re.sub(r"\s+", " ", cleaned.lower())
+    return _CATEGORY_MAP_TO_SWEDISH.get(key, cleaned)
 
-_POLICY_DETAIL_MARKERS = [
-    "lag",
-    "lagstiftning",
-    "reform",
-    "budget",
-    "anslag",
-    "myndighet",
-    "kommun",
-    "region",
-    "skola",
-    "sjukvard",
-    "skatt",
-    "polis",
-    "domstol",
-    "arbetsloshet",
-    "ersattning",
-    "bidrag",
-    "migration",
-    "klimat",
-    "miljo",
-]
+
+_MIN_PROMISE_CHARS = 20
+_MIN_PROMISE_WORDS = 4
+_MAX_PROMISE_CHARS = 320
 
 
 def _normalize_for_match(text: str) -> str:
@@ -311,32 +552,38 @@ def _normalize_for_match(text: str) -> str:
     return text
 
 
-def _promise_specificity_score(text: str) -> int:
-    normalized = _normalize_for_match(text)
-    score = 0
+def _sentence_case(text: str) -> str:
+    cleaned = str(text or "").strip(" .;:,")
+    if not cleaned:
+        return ""
+    return cleaned[:1].upper() + cleaned[1:]
 
-    if any(marker in normalized for marker in _COMMITMENT_MARKERS):
-        score += 1
-    if any(marker in normalized for marker in _POLICY_DETAIL_MARKERS):
-        score += 1
-    if re.search(r"\d", normalized):
-        score += 1
-    if len(normalized.split()) >= 9:
-        score += 1
 
-    return score
+def _clean_extracted_promise_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"^[\-\*\u2022\(\)\[\]\d\.\s]+", "", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned.strip("\"'` ")
+    return _sentence_case(cleaned)
 
 
 def _is_concrete_promise_text(text: str) -> bool:
     normalized = _normalize_for_match(text)
     if not normalized:
         return False
-    if len(normalized) < 35:
+    if len(normalized) < _MIN_PROMISE_CHARS:
         return False
-    if any(pattern in normalized for pattern in _GENERIC_PROMISE_PATTERNS):
-        # Tillat generic fras endast om den ocksa innehaller tydliga detaljer.
-        return _promise_specificity_score(normalized) >= 3
-    return _promise_specificity_score(normalized) >= 2
+    if len(normalized) > _MAX_PROMISE_CHARS:
+        return False
+    if len(normalized.split()) < _MIN_PROMISE_WORDS:
+        return False
+    if normalized.endswith("?"):
+        return False
+    if re.fullmatch(r"[\W\d_]+", normalized):
+        return False
+    return True
 
 
 def _dedupe_promises(rows: list[dict]) -> list[dict]:
@@ -355,28 +602,11 @@ def _compress_text_for_extraction(text: str, max_chars: int) -> str:
     if len(text) <= max_chars:
         return text
 
-    lines = [re.sub(r"\s+", " ", line).strip() for line in text.splitlines()]
-    lines = [line for line in lines if line]
-
-    # Prioritera rader med lofte-signaler/siffror.
-    selected: list[str] = []
-    total = 0
-    for line in lines:
-        lower = line.lower()
-        is_signal = any(marker.strip() in lower for marker in _COMMITMENT_MARKERS) or bool(re.search(r"\d", lower))
-        if not is_signal:
-            continue
-        if total + len(line) + 1 > max_chars:
-            break
-        selected.append(line)
-        total += len(line) + 1
-
-    if selected and total >= max_chars // 2:
-        return "\n".join(selected)[:max_chars]
-
-    # Fallback: ta inledning + slut.
-    half = max_chars // 2
-    return f"{text[:half]}\n...\n{text[-half:]}"
+    # Sprakneutral komprimering: inledning + slut ger bred kontext
+    # utan ordlistor som riskerar feltolkning.
+    head = int(max_chars * 0.6)
+    tail = max_chars - head
+    return f"{text[:head]}\n...\n{text[-tail:]}"
 
 
 async def _ollama_chat(prompt: str, model_name: str) -> str:
@@ -405,8 +635,8 @@ def _normalize_extracted_promises(payload: dict) -> ExtractedPromises:
     for item in raw_promises:
         if not isinstance(item, dict):
             continue
-        text = str(item.get("text", "")).strip()
-        category = str(item.get("category", "")).strip() or "Ovrigt"
+        text = _clean_extracted_promise_text(str(item.get("text", "")).strip())
+        category = _normalize_category_label(str(item.get("category", "")).strip() or "Ovrigt")
         if not text:
             continue
         if not _is_concrete_promise_text(text):
@@ -433,8 +663,12 @@ Svara ENDAST med giltig JSON i exakt detta format:
 
 Regler:
 - Ta bara konkreta ataganden, inte vaga visioner.
-- Hall texten nara originalet.
-- Varje lofte ska vara 1-3 meningar och ange vad + vem + hur (nar det framgar i kallan).
+- Skriv loftet i neutral och enkel policy-svenska.
+- Om metod saknas (bara malbild) ska loftet inte tas med.
+- Om metod uttrycks i bisats (genom/via/med), skriv metoden som huvudatgard.
+- Hall dig till uppgifter som finns i kalltexten.
+- Skriv allt pa svenska.
+- Varje lofte ska vara en kort mening som beskriver konkret atgard.
 - Behall siffror, procentsatser, belopp, datum och malnivaer om de finns.
 - Om inga konkreta loften finns: {{"promises":[]}}
 
@@ -474,7 +708,10 @@ async def extract_promises_from_text(text: str, party_name: str, source_url: str
 ---
 
 Returnera bara konkreta, specifika loften. Skippa vaga visioner och allmanna uttalanden.
-Varje lofte ska vara 1-3 meningar och tydliggora vad + vem + hur.
+Skriv varje lofte i neutral och enkel policy-svenska utan slogans.
+Om metod saknas (bara malbild) ska loftet inte tas med.
+Om metod uttrycks i bisats (genom/via/med), skriv metoden som huvudatgard.
+Varje lofte ska vara en kort mening som beskriver konkret atgard.
 Behall siffror, procentsatser, belopp, datum och malnivaer nar de finns."""
 
     pydantic_error: Exception | None = None
@@ -501,7 +738,8 @@ Behall siffror, procentsatser, belopp, datum och malnivaer nar de finns."""
 
     for model_name in candidate_models:
         try:
-            return await _extract_promises_via_plain_ollama(text, party_name, source_url, model_name)
+            plain_result = await _extract_promises_via_plain_ollama(text, party_name, source_url, model_name)
+            return plain_result
         except Exception as plain_exc:
             last_error = plain_exc
 
