@@ -72,6 +72,20 @@ COLLECTIONS = {
             "compared_at": str,
         },
     },
+    "monitored_content": {
+        "type": "document",
+        "schema": {
+            "politician_key": str,  # Koppling till politiker
+            "platform": str,        # "tiktok", "twitter", "instagram"
+            "item_id": str,         # Unikt RSS-item-ID (guid/link)
+            "item_url": str,        # OriginalURL till inlägget
+            "item_title": str,      # Titel/caption
+            "analysis_key": str,    # Koppling till skapad analys
+            "fetched_at": str,      # ISO timestamp
+            "status": str,          # "analyzed", "skipped", "failed"
+            "comparisons_done": int,
+        },
+    },
 }
 
 

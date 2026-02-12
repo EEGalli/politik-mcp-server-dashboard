@@ -6,3 +6,5 @@ httpx>=0.28.0
 pymupdf>=1.26.0
 
 streamlit>=1.38.0
+
+feedparser>=6.0.0

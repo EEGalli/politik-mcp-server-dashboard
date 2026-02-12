@@ -40,6 +40,10 @@ from src.agents import (
     extract_promises_from_text,
     fetch_page_text,
 )
+from src.feed_monitor import (
+    check_feeds as _check_feeds,
+    get_monitor_status as _get_monitor_status,
+)
 
 mcp = FastMCP(
     "Politik Analyzer",
@@ -561,6 +565,38 @@ def get_consistency_report(politician_key: str) -> str:
         politician_key: Politikerns databas-nyckel
     """
     result = _get_consistency_report(get_db(), politician_key)
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+# ── Bevakning-tools ─────────────────────────────────────────────
+
+
+@mcp.tool()
+async def check_feeds_now(politician_key: str = "") -> str:
+    """Kontrollera sociala medier-flöden via RSSHub för nya inlägg.
+    Analyserar nytt innehåll och jämför med partiets vallöften.
+
+    Args:
+        politician_key: Kontrollera bara denna politiker (lämna tomt för alla)
+    """
+    result = await _check_feeds(
+        db=get_db(),
+        politician_key=politician_key,
+    )
+    return json.dumps(result, ensure_ascii=False, default=str)
+
+
+@mcp.tool()
+def get_feed_monitor_status(politician_key: str = "") -> str:
+    """Visa bevakningsstatus: senaste kontroll, antal hittade inlägg per plattform.
+
+    Args:
+        politician_key: Filtrera per politiker (lämna tomt för alla)
+    """
+    result = _get_monitor_status(
+        db=get_db(),
+        politician_key=politician_key,
+    )
     return json.dumps(result, ensure_ascii=False, default=str)
 
 

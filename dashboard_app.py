@@ -1561,6 +1561,131 @@ with st.expander("Snabbflöde: Parti + scraping", expanded=True):
             _render_scrape_result(st.session_state["last_scrape_result"])
 
 
+# ── Bevakning (sociala medier via RSSHub) ────────────────────────
+
+with st.expander("Bevakning (sociala medier via RSSHub)", expanded=False):
+    st.caption(
+        "Automatisk bevakning av politikers TikTok via RSSHub. "
+        "Kräver att RSSHub körs lokalt via Docker."
+    )
+
+    bev_col1, bev_col2 = st.columns(2)
+
+    with bev_col1:
+        st.subheader("Bevakningsstatus")
+        bev_politician_filter = st.text_input(
+            "Filtrera per politiker-nyckel (valfritt)",
+            value="",
+            key="monitor_politician_filter",
+        )
+        if st.button("Visa status", key="monitor_show_status"):
+            try:
+                status = _call_tool(
+                    mcp_server.get_feed_monitor_status,
+                    {"politician_key": bev_politician_filter.strip()},
+                )
+                if isinstance(status, dict):
+                    summary = status.get("summary", [])
+                    if isinstance(summary, list) and summary:
+                        st.dataframe(summary, hide_index=True, use_container_width=True)
+                    else:
+                        st.info("Ingen bevakningsdata hittad ännu.")
+
+                    recent = status.get("recent_items", [])
+                    if isinstance(recent, list) and recent:
+                        st.markdown("**Senaste hämtade inlägg**")
+                        for item in recent:
+                            if not isinstance(item, dict):
+                                continue
+                            name = str(item.get("politician_name", "") or "")
+                            platform = str(item.get("platform", "") or "")
+                            title = str(item.get("item_title", "") or "")
+                            url = str(item.get("item_url", "") or "")
+                            item_status = str(item.get("status", "") or "")
+                            fetched = str(item.get("fetched_at", "") or "")
+                            st.markdown(f"**{name}** ({platform}) — {item_status}")
+                            if title:
+                                st.caption(title[:200])
+                            if url:
+                                st.caption(url)
+                            if fetched:
+                                st.caption(f"Hämtad: {fetched}")
+                            st.divider()
+                else:
+                    st.json(status)
+            except Exception as exc:
+                st.error(f"Kunde inte hämta bevakningsstatus: {exc}")
+
+    with bev_col2:
+        st.subheader("Kör bevakning nu")
+        st.caption("Kontrollera RSSHub-flöden och analysera nya inlägg")
+
+        run_politician_key = st.text_input(
+            "Specifik politiker-nyckel (valfritt, lämna tomt för alla)",
+            value="",
+            key="monitor_run_politician",
+        )
+
+        if st.button("Kör bevakning nu", key="monitor_run_now", type="primary"):
+            with st.spinner("Kontrollerar flöden och analyserar nya inlägg..."):
+                try:
+                    result = _call_tool(
+                        mcp_server.check_feeds_now,
+                        {"politician_key": run_politician_key.strip()},
+                        is_async=True,
+                    )
+                    if isinstance(result, dict):
+                        if result.get("error"):
+                            st.error(str(result["error"]))
+                        else:
+                            checked = result.get("politicians_checked", 0)
+                            checked_at = result.get("checked_at", "")
+                            st.success(
+                                f"Bevakning klar! {checked} politiker kontrollerade."
+                            )
+                            if checked_at:
+                                st.caption(f"Tid: {checked_at}")
+
+                        for pol_result in result.get("results", []):
+                            if not isinstance(pol_result, dict):
+                                continue
+                            pol_name = str(
+                                pol_result.get("politician_name", "")
+                            ).strip()
+                            pol_status = str(
+                                pol_result.get("status", "")
+                            ).strip()
+                            reason = str(pol_result.get("reason", "")).strip()
+
+                            label = f"**{pol_name}**: {pol_status}"
+                            if reason:
+                                label += f" ({reason})"
+                            st.markdown(label)
+
+                            platforms = pol_result.get("platforms", {})
+                            if isinstance(platforms, dict):
+                                for pf_name, pf_data in platforms.items():
+                                    if not isinstance(pf_data, dict):
+                                        continue
+                                    pf_status = str(pf_data.get("status", ""))
+                                    new_items = pf_data.get("items_new", 0)
+                                    total = pf_data.get("total_entries", 0)
+                                    pf_error = str(
+                                        pf_data.get("error", "")
+                                    ).strip()
+                                    line = (
+                                        f"  {pf_name}: {pf_status} "
+                                        f"({new_items} nya av {total} i flödet)"
+                                    )
+                                    if pf_error:
+                                        line += f" — {pf_error}"
+                                    st.caption(line)
+                    else:
+                        st.json(result)
+                except Exception as exc:
+                    st.error(f"Bevakning misslyckades: {exc}")
+
+
 with st.expander("Video -> Match mot partiets politik", expanded=True):
     try:
         analyzer_root = get_video_analyzer_root()
