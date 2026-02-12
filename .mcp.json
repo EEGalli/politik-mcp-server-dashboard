@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "politik-analyzer": {
+      "command": "python3",
+      "args": ["-m", "src.server"],
+      "cwd": "/Users/evelinagalli/Desktop/FOJO/politik-mcp-server"
+    }
+  }
+}
